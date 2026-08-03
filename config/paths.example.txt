@@ -1,0 +1,9 @@
+# Machine-specific paths — copy this file to config/paths.txt and fill in.
+# config/paths.txt is git-ignored so private/cluster paths never reach the repo.
+# Format: KEY=VALUE, '#' starts a comment, '~' is expanded.
+
+# Copy-move dataset: folders of forged images and their RGB masks
+# (RED = forged region, GREEN = source region, BLUE = background).
+# Image and mask files must pair up by sorted order / matching names.
+CMFD_IMAGES=/path/to/dataset/images
+CMFD_MASKS=/path/to/dataset/masks
