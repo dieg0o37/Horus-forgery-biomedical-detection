@@ -1,9 +1,26 @@
 # Machine-specific paths — copy this file to config/paths.txt and fill in.
 # config/paths.txt is git-ignored so private/cluster paths never reach the repo.
 # Format: KEY=VALUE, '#' starts a comment, '~' is expanded.
+#
+# ABSOLUTE paths are strongly recommended. A relative value is resolved against
+# the repo root (not the current directory), so '../../../../hadatasets/...'
+# only lands on /hadatasets while the repo sits exactly 3 levels below '/'.
+# It silently points somewhere else on any other machine.
 
-# Copy-move dataset: folders of forged images and their RGB masks
-# (RED = forged region, GREEN = source region, BLUE = background).
-# Image and mask files must pair up by sorted order / matching names.
-CMFD_IMAGES=/path/to/dataset/images
-CMFD_MASKS=/path/to/dataset/masks
+# Copy-move dataset, one image folder + one mask folder per split.
+# Masks are RGB: RED = forged region, GREEN = source region, BLUE = background.
+# An image and its mask must share the same filename.
+CMFD_TRAIN_IMAGES=/path/to/dataset/train/random_copy_move/images
+CMFD_TRAIN_MASKS=/path/to/dataset/train/random_copy_move/masks
+CMFD_TEST_IMAGES=/path/to/dataset/test/random_copy_move/images
+CMFD_TEST_MASKS=/path/to/dataset/test/random_copy_move/masks
+CMFD_VAL_IMAGES=/path/to/dataset/val/random_copy_move/images
+CMFD_VAL_MASKS=/path/to/dataset/val/random_copy_move/masks
+
+# METADATA = data about images: name, dataset of origin, split, etc...
+IMAGES_METADATA=/path/to/dataset/metadata.csv
+
+# Base images carry no copy-move forgery, so their masks have no red/green
+# regions. diagnose_sift.py needs a forged pair and will skip them.
+BASE_IMAGES=/path/to/dataset_base/images
+BASE_MASKS=/path/to/dataset_base/masks

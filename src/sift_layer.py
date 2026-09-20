@@ -1,12 +1,17 @@
 import os, csv, numpy as np, shutil, cv2 as cv
 
+# neighbours fetched per query before the min_distance filter. Must be large
+# enough that >=2 candidates survive that filter; diagnose_sift.py reports a
+# 'knn_k_truncation' bucket if it ever is not.
+KNN_K = 10
+
 def find_good_matches(kp, descriptors, ratio_threshold, min_distance):
   if (descriptors is None) or len(descriptors) <= 2:
     return []
 
   bf = cv.BFMatcher()
 
-  raw_matches = bf.knnMatch(descriptors, descriptors, k=10)
+  raw_matches = bf.knnMatch(descriptors, descriptors, k=min(KNN_K, len(descriptors)))
 
   good_matches = []
   for q, ms in enumerate(raw_matches):
@@ -14,7 +19,9 @@ def find_good_matches(kp, descriptors, ratio_threshold, min_distance):
     cand = [m for m in ms if m.trainIdx != q
             and np.linalg.norm(np.array(kp[m.trainIdx].pt) - p_q) > min_distance]
     if len(cand) >= 2 and cand[0].distance < ratio_threshold * cand[1].distance:
-      good_matches.append((kp[q], kp[cand[0].trainIdx]))
+      # return INDEX pairs: run_sift_layer maps them to keypoints for run_RANSAC,
+      # and diagnose_sift.py needs the indices to line matches up with ground truth
+      good_matches.append((q, cand[0].trainIdx))
 
   return good_matches
 
