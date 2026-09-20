@@ -6,24 +6,15 @@ def find_good_matches(kp, descriptors, ratio_threshold, min_distance):
 
   bf = cv.BFMatcher()
 
-  raw_matches = bf.knnMatch(descriptors, descriptors, k=3)
+  raw_matches = bf.knnMatch(descriptors, descriptors, k=10)
 
   good_matches = []
-  for m in raw_matches:
-    m = [matches for matches in m if matches.trainIdx != matches.queryIdx]
-    if len(m) == 2:
-      m1, m2 = m
-
-      if m1.distance < ratio_threshold * m2.distance:
-        # if m1.queryIdx > m1.trainIdx later if deduplication of pairs doesnt help here.
-
-        p1 = np.array(kp[m1.queryIdx].pt)
-        p2 = np.array(kp[m1.trainIdx].pt)
-
-        pixel_dist = np.linalg.norm(p1 - p2)
-
-        if pixel_dist > min_distance:
-          good_matches.append((m1.queryIdx, m1.trainIdx))
+  for q, ms in enumerate(raw_matches):
+    p_q = np.array(kp[q].pt)
+    cand = [m for m in ms if m.trainIdx != q
+            and np.linalg.norm(np.array(kp[m.trainIdx].pt) - p_q) > min_distance]
+    if len(cand) >= 2 and cand[0].distance < ratio_threshold * cand[1].distance:
+      good_matches.append((kp[q], kp[cand[0].trainIdx]))
 
   return good_matches
 
