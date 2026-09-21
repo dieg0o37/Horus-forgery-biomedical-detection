@@ -5,6 +5,33 @@ import os, csv, numpy as np, shutil, cv2 as cv
 # 'knn_k_truncation' bucket if it ever is not.
 KNN_K = 10
 
+PREPROCESS_MODES = ("none", "stretch", "clahe")
+_CLAHE = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+
+def preprocess(gray, mode="none"):
+  """Contrast normalisation applied to the grey image before SIFT.
+
+  SIFT's contrastThreshold is measured on [0, 1] intensities, so an image whose
+  content spans only grey levels 3..31 (common in the SIID and TYC microscopy
+  sets) loses most of its keypoints to the threshold.
+    stretch  map the 0.5..99.5 percentile range onto 0..255. Strongest rescue,
+             but it also amplifies sensor noise into many spurious keypoints.
+    clahe    local histogram equalisation (clip 2.0, 8x8 tiles). Gentler on
+             noise, and better than stretch on low-contrast Western blots.
+  """
+  if mode == "none":
+    return gray
+  if mode == "stretch":
+    lo, hi = np.percentile(gray, (0.5, 99.5))
+    if hi - lo < 1:
+      return gray                     # flat image: nothing to stretch
+    out = (gray.astype(np.float32) - lo) * (255.0 / (hi - lo))
+    return np.clip(out, 0, 255).astype(np.uint8)
+  if mode == "clahe":
+    return _CLAHE.apply(gray)
+  raise ValueError(f"unknown preprocess mode {mode!r}, expected one of {PREPROCESS_MODES}")
+
 def find_good_matches(kp, descriptors, ratio_threshold, min_distance):
   if (descriptors is None) or len(descriptors) <= 2:
     return []
@@ -13,17 +40,24 @@ def find_good_matches(kp, descriptors, ratio_threshold, min_distance):
 
   raw_matches = bf.knnMatch(descriptors, descriptors, k=min(KNN_K, len(descriptors)))
 
-  good_matches = []
-  for q, ms in enumerate(raw_matches):
-    p_q = np.array(kp[q].pt)
-    cand = [m for m in ms if m.trainIdx != q
-            and np.linalg.norm(np.array(kp[m.trainIdx].pt) - p_q) > min_distance]
-    if len(cand) >= 2 and cand[0].distance < ratio_threshold * cand[1].distance:
-      # return INDEX pairs: run_sift_layer maps them to keypoints for run_RANSAC,
-      # and diagnose_sift.py needs the indices to line matches up with ground truth
-      good_matches.append((q, cand[0].trainIdx))
+  pts = np.array([k.pt for k in kp], dtype=np.float64)
+  tid = np.array([[m.trainIdx for m in ms] for ms in raw_matches], dtype=np.intp)
+  dist = np.array([[m.distance for m in ms] for ms in raw_matches], dtype=np.float64)
+  qs = np.arange(len(raw_matches), dtype=np.intp)[:, None]
 
-  return good_matches
+  pixel_dist = np.linalg.norm(pts[tid] - pts[qs], axis=2) 
+  keep = (tid != qs) & (pixel_dist > min_distance)
+
+  rank = np.cumsum(keep, axis=1)                          
+  has_two = keep.sum(axis=1) >= 2
+  first = np.argmax(keep & (rank == 1), axis=1)
+  second = np.argmax(keep & (rank == 2), axis=1)
+
+  rows = np.arange(len(raw_matches), dtype=np.intp)
+  d1, d2 = dist[rows, first], dist[rows, second]
+  accept = has_two & (d1 < ratio_threshold * d2)
+
+  return list(zip(rows[accept].tolist(), tid[rows, first][accept].tolist()))
 
 
 def run_RANSAC(good_matches, max_clusters, ransac_threshold, min_inliers):
@@ -86,7 +120,8 @@ def run_sift_layer(
       ratio_threshold: float, 
       min_distance: float,
       contrast_thresh: float, 
-      edge_thresh: float
+      edge_thresh: float,
+      preprocess_mode: str = "none"
       ) -> None:
 
     
@@ -120,7 +155,7 @@ def run_sift_layer(
 
         sift = cv.SIFT_create(contrastThreshold=contrast_thresh, edgeThreshold=edge_thresh)
 
-        kp, descriptors = sift.detectAndCompute(gray_img, None)
+        kp, descriptors = sift.detectAndCompute(preprocess(gray_img, preprocess_mode), None)
 
         if _print:
             kp_img = cv.drawKeypoints(image=gray_img, keypoints=kp, outImage=None, flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
@@ -159,12 +194,16 @@ if __name__ == "__main__":
     elif input[0]=="False":
        _print=False
     else:
-      print("input format: python sift_layer.py <_print> <ratio_threshold> <min_distance> <contrast_threshold> <edge_threshold>")
+      print("input format: python sift_layer.py <_print> <ratio_threshold> <min_distance> <contrast_threshold> <edge_threshold> [none|stretch|clahe]")
       exit(1)
     ratio_threshold = float(input[1])
     min_dist = float(input[2])
     contrast_threshold = float(input[3])
     edge_threshold = float(input[4])
+    preprocess_mode = input[5] if len(input) > 5 else "none"
+    if preprocess_mode not in PREPROCESS_MODES:
+      print("input format: python sift_layer.py <_print> <ratio_threshold> <min_distance> <contrast_threshold> <edge_threshold> [none|stretch|clahe]")
+      exit(1)
     run_sift_layer(
        image_folder_path=image_folder_path,
        output_csv=output_csv,
@@ -175,11 +214,12 @@ if __name__ == "__main__":
        ratio_threshold=ratio_threshold,
        min_distance=min_dist,
        contrast_thresh=contrast_threshold,
-       edge_thresh=edge_threshold
+       edge_thresh=edge_threshold,
+       preprocess_mode=preprocess_mode
     )
     # clusters = run_RANSAC(good_matches=good_matches, max_clusters=100, ransac_threshold=5.0, min_inliers=4)
   except TypeError:
-     print("input format: python sift_layer.py <_print> <ratio_threshold> <min_distance> <contrast_threshold> <edge_threshold>")
+     print("input format: python sift_layer.py <_print> <ratio_threshold> <min_distance> <contrast_threshold> <edge_threshold> [none|stretch|clahe]")
      exit(1)
       
 
