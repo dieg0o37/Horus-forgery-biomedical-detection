@@ -82,11 +82,6 @@ def split_mask(mask):
   return src, dst
 
 
-def _iou(a, b):
-  union = np.count_nonzero(a | b)
-  return float(np.count_nonzero(a & b)) / union if union else 0.0
-
-
 def _centroid(m):
   ys, xs = np.nonzero(m)
   return np.array([xs.mean(), ys.mean()])
@@ -105,15 +100,71 @@ def _warp(mask, matrix, shape):
                        flags=cv.INTER_NEAREST) > 0
 
 
+def _shift_by_overlap(src, dst):
+  """Integer shift t that maximises |(src + t) & dst|, the number of pasted-region
+  pixels explained by the shifted source, by FFT cross-correlation of the two
+  masks' bounding-box crops (zero-padded, so there is no wrap-around).
+
+  Unlike the centroid difference this stays exact when the two regions overlap
+  and the mask paints the overlap in only one colour: the hidden part shifts that
+  region's centroid, but at the true shift every visible pixel of the smaller
+  mask is still covered, which is the largest overlap any shift can reach.
+  """
+  ys, xs = np.nonzero(src)
+  yd, xd = np.nonzero(dst)
+  a = src[ys.min():ys.max() + 1, xs.min():xs.max() + 1].astype(np.float32)
+  b = dst[yd.min():yd.max() + 1, xd.min():xd.max() + 1].astype(np.float32)
+  h, w = a.shape[0] + b.shape[0] - 1, a.shape[1] + b.shape[1] - 1
+  corr = np.fft.irfft2(np.fft.rfft2(b, (h, w)) * np.conj(np.fft.rfft2(a, (h, w))), (h, w))
+  ky, kx = np.unravel_index(np.argmax(np.rint(corr)), corr.shape)
+  ky = ky if ky < b.shape[0] else ky - h        # indices past b's size are negative lags
+  kx = kx if kx < b.shape[1] else kx - w
+  return xd.min() - xs.min() + kx, yd.min() - ys.min() + ky
+
+
+def _fit(a, b, matrix):
+  """How well `matrix` maps mask a onto mask b, allowing for the overlap.
+
+  recall    = share of b covered by the warped a
+  precision = share of the warped a that lands on b, or on a itself: where the
+              copy overlaps its source, the mask shows only one of the two
+              colours, so the warped a legitimately lands on a there.
+  """
+  wa = _warp(a, matrix, b.shape)
+  n_wa, n_b = np.count_nonzero(wa), np.count_nonzero(b)
+  if not n_wa or not n_b:
+    return 0.0
+  recall = np.count_nonzero(wa & b) / n_b
+  precision = np.count_nonzero(wa & (a | b)) / n_wa
+  return float(min(recall, precision))
+
+
+def _gt_score(src, dst, matrix):
+  # whichever mask lost the overlap, one of the two directions sees the full region
+  return max(_fit(src, dst, matrix), _fit(dst, src, cv.invertAffineTransform(matrix)))
+
+
 def estimate_gt_transform(src, dst):
   """
   Tries pure translation first and only falls back to a moment-based similarity search if
-  translation fails to explain the masks. Returns (matrix, method, iou).
+  translation fails to explain the masks. Returns (matrix, method, score), where score is
+  the overlap-aware fit of _gt_score (1.0 = the transform explains both masks exactly).
+
+  The translation is the shift with the largest mask overlap (_shift_by_overlap), not the
+  centroid difference: when the source and the copy overlap, the mask paints the shared
+  pixels in one colour only, which moves one centroid by several pixels. That put the
+  ground truth 3-6px off on ~12% of the images first reported as failures, so correct
+  matches fell outside --tol-px and were counted as wrong.
   """
   cs, cd = _centroid(src), _centroid(dst)
 
-  trans = np.float32([[1, 0, cd[0] - cs[0]], [0, 1, cd[1] - cs[1]]])
-  best = (trans, "translation", _iou(_warp(src, trans, dst.shape), dst))
+  best = (None, "translation", -1.0)
+  shifts = (_shift_by_overlap(src, dst), (cd[0] - cs[0], cd[1] - cs[1]))
+  for tx, ty in shifts:
+    trans = np.float32([[1, 0, tx], [0, 1, ty]])
+    score = _gt_score(src, dst, trans)
+    if score > best[2]:
+      best = (trans, "translation", score)
 
   if best[2] < 0.9:
     scale = np.sqrt(np.count_nonzero(dst) / max(np.count_nonzero(src), 1))
@@ -127,7 +178,7 @@ def estimate_gt_transform(src, dst):
                                 [np.sin(th), np.cos(th)]])
         off = cd - rot @ cs
         cand = np.float32(np.hstack([rot, off.reshape(2, 1)]))
-        score = _iou(_warp(src, cand, dst.shape), dst)
+        score = _gt_score(src, dst, cand)
         if score > best[2]:
           best = (cand, "similarity", score)
 
@@ -243,7 +294,7 @@ def diagnose_image(gray, src_mask, dst_mask, gt, args):
 
   row = {
     "gt_method": method,
-    "gt_mask_iou": round(gt_iou, 4),
+    "gt_mask_iou": round(gt_iou, 4),   # overlap-aware fit (_gt_score); name kept for old CSVs
     "gt_dx": round(float(matrix[0, 2]), 2),
     "gt_dy": round(float(matrix[1, 2]), 2),
     "src_area_px": int(np.count_nonzero(src_mask)),
@@ -611,8 +662,14 @@ class _CsvStream:
       self.f.flush()
 
   def close(self):
+    # the cluster filesystem has returned EIO here after every row was written;
+    # warn instead of raising, so the summary (built from memory) still prints
     if self.f:
-      self.f.close()
+      try:
+        self.f.close()
+      except OSError as e:
+        print(f"!! closing {self.path} failed ({e}); its last rows may be missing",
+              file=sys.stderr, flush=True)
 
 
 def run(args):
@@ -751,7 +808,7 @@ def summarise(img_rows, skipped, args, img_csv):
   bad_gt = [r for r in img_rows if not r["gt_ok"]]
   if bad_gt:
     print(f"\n!! {len(bad_gt)} image(s) with unreliable ground-truth transform "
-          f"(mask IoU < {args.min_gt_iou}) -- treat their rows with suspicion")
+          f"(mask fit < {args.min_gt_iou}) -- treat their rows with suspicion")
 
   tot = lambda k: sum(r[k] for r in img_rows)
 
@@ -1000,7 +1057,7 @@ def parse_args():
                  help="how far a keypoint may sit from its predicted position and "
                       "still count as the correct partner")
   p.add_argument("--min-gt-iou", type=float, default=0.5,
-                 help="mask IoU below which the recovered transform is flagged")
+                 help="mask fit (overlap-aware, see _gt_score) below which the recovered transform is flagged")
 
   args = p.parse_args()
 
