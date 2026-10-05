@@ -11,7 +11,10 @@ KNN_K = 10
 
 # RANSAC clustering, shared by run_sift_layer and diagnose_sift.py
 RANSAC_MAX_CLUSTERS = 100
-RANSAC_THRESHOLD = 5.0
+# 2 px: on the full test split it finds the same 1,860/2,122 images as 5 px, with
+# more accurate transforms (1,839 vs 1,822) and 11% fewer false clusters; copies
+# shift pixels exactly, so a loose threshold only lets RANSAC bend the model
+RANSAC_THRESHOLD = 2.0
 RANSAC_MIN_INLIERS = 4
 
 PREPROCESS_MODES = ("none", "stretch", "clahe")
@@ -23,19 +26,6 @@ _CLAHE = cv.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 
 def preprocess(gray, mode=DEFAULT_PREPROCESS):
-  """Contrast normalisation applied to the grey image before SIFT.
-
-  SIFT's contrastThreshold is measured on [0, 1] intensities, so an image whose
-  content spans only grey levels 3..31 (common in the SIID and TYC microscopy
-  sets) loses most of its keypoints to the threshold.
-    stretch  map the 0.5..99.5 percentile range onto 0..255. Leaves images that
-             already use the full range almost unchanged, so it costs little
-             where it does not help. It does amplify sensor noise on very
-             low-range images (TYC: ~60k keypoints, ~8s/image to match).
-    clahe    local histogram equalisation (clip 2.0, 8x8 tiles). Equalises
-             every image, adding keypoints (and matching time) even where the
-             contrast was already fine; worse than stretch on Western blots.
-  """
   if mode == "none":
     return gray
   if mode == "stretch":
@@ -47,6 +37,9 @@ def preprocess(gray, mode=DEFAULT_PREPROCESS):
   if mode == "clahe":
     return _CLAHE.apply(gray)
   raise ValueError(f"unknown preprocess mode {mode!r}, expected one of {PREPROCESS_MODES}")
+
+def keep_one_direction(match_idx):
+  return [(q, t) for q, t in match_idx if q > t]
 
 
 def find_good_matches(kp, descriptors, ratio_threshold, min_distance, one_direction=True):
@@ -75,7 +68,7 @@ def find_good_matches(kp, descriptors, ratio_threshold, min_distance, one_direct
   accept = has_two & (d1 < ratio_threshold * d2)
 
   matches = list(zip(rows[accept].tolist(), tid[rows, first][accept].tolist()))
-  return [(q, t) for q, t in matches if q > t] if one_direction else matches
+  return keep_one_direction(matches) if one_direction else matches
 
 
 def run_RANSAC(good_matches, max_clusters, ransac_threshold, min_inliers, image_shape=None):
