@@ -20,7 +20,12 @@ CMFD_VAL_MASKS=/path/to/dataset/val/random_copy_move/masks
 # METADATA = data about images: name, dataset of origin, split, etc...
 IMAGES_METADATA=/path/to/dataset/metadata.csv
 
-# Base images carry no copy-move forgery, so their masks have no red/green
-# regions. diagnose_sift.py needs a forged pair and will skip them.
+# Base images carry no copy-move forgery. Their masks are binary object masks
+# (0 = background, 255 = object) named <image stem>_gt.png. src/base_sift.py
+# (run_base.sh) runs the SIFT layer on them to measure false alarms;
+# diagnose_sift.py needs a forged pair and cannot use them.
 BASE_IMAGES=/path/to/dataset_base/images
 BASE_MASKS=/path/to/dataset_base/masks
+# optional: CSV mapping each base image to its source dataset (columns are
+# auto-detected); base_sift.py falls back to IMAGES_METADATA
+# BASE_METADATA=/path/to/dataset_base/metadata.csv
