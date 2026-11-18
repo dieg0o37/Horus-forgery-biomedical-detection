@@ -1,67 +1,47 @@
-# Finding forgery in bioscientific 
+# Copy-move forgery detection in bioscientific images
 
-This is a research repository where I will run tests and document all my discoveries and methods in great detail to solve a relatively open problem. In order to achieve better results within my constraint, I will test theories, compare them and document my findings in form of graphs, .csv files and other logs. My intention is to use this repo and the final results to build a detailed undergrad research report.
+A copy-move forgery copies a region of an image and pastes it elsewhere in the same image, for example to duplicate a band in a Western blot or a cell in a microscopy image. This repository detects such forgeries: for each image it decides whether it contains a copy-move pair and, if so, returns where the source region and its copy are, and the transform between them.
 
-## The problem, in plain words
+## Pipeline
 
-In science, the images in a paper (microscope photos, gels, cell cultures) are
-evidence. A common way to fake that evidence is **copy-move**: take a piece of the
-image and paste a copy somewhere else in the *same* image, to invent a result that
-was never there, or to hide one that was.
+1. **Preprocess:** percentile contrast stretch, so dark and washed-out images keep their keypoints.
+2. **Keypoints:** SIFT (contrast threshold 0.01, edge threshold 30). LIFT is available as an alternative.
+3. **Self-matching:** each keypoint against its 10 nearest descriptors in the same image; partners closer than 8 px are dropped, then a ratio test of 0.7.
+4. **Clustering:** RANSAC fits a partial affine transform (2 px threshold) to the matches, cluster by cluster.
+5. **Decision:** the image is flagged when its first cluster has at least 10 inliers. That cluster gives the two regions and the transform.
 
-This project seeks to answers two questions about such a fake:
+## Contents
 
-For a given image, does it contain a copy-move forgery? If yes, where is this copy-move pair?
+| file | what it does |
+|---|---|
+| `src/sift_lift_layer.py` | the detection pipeline above, with SIFT or LIFT features |
+| `src/lift.py` | PyTorch port of LIFT (Yi et al., ECCV 2016) using the authors' pretrained weights, downloaded on first use |
+| `src/diagnose_sift.py` | evaluation on forged images against their masks: whether each forgery is found, and at which stage it is lost when it is not |
+| `src/fft_layer.py`, `src/eval_fft.py` | an experimental polar FFT verifier for clusters, and an evaluation on forged and unforged images that draws every false positive for inspection |
+| `util/region_from_kp.py` | turns a cluster's keypoints into a region (convex hull and bounding box) |
+| `config/paths.example.txt` | template for the dataset locations (copy to `config/paths.txt`) |
 
-The idea is to implement a cascade algorithm, starting with a fast but imprecise first step of using LIFT to find self similar groups of keypoints in the image. 
+## How accuracy is measured
 
-Problem: microscope photos, gels, cell cultures have low contrast an few distinctive features, it is expected for LIFT with a high threshold to fail to identify the forgery consistenly.
+- **Forged images** (10,619 images from 9 source datasets) come with masks marking the source region and its copy. The true transform is recovered from the masks. A cluster is correct when most of its matched pairs land within 3 px of where the true transform sends them. An image counts as **detected** when its first cluster is correct.
+- **Unforged images** (2,691) measure false alarms. Matches on annotations (sample labels, rulers, scale-bar text) are acceptable to flag; a **false positive** is an image flagged on its content (cells, particles, blots or background). Every flagged unforged image was checked by eye.
 
-Solution: Utilize an extremely low threshold to identify a large number of keypoints, amongst these keypoints, find a certain number of potencial pair regions of forgery and then use a more robust algorithm to find the true copy-move pairs if they exist.
+## Results
 
-More robust algorithm: First, write an algorithm that can turn groups of keypoints into pairs of regions of pixels. After that, compare these regions utilizing something that is resilient to rotation, translation and scale changes to compare similarity between regions. 2 Ideas:
-  - 1) Polar FFT, very simply, perform an FFT of the region with the total image (excluding the region itself by a slight margin because forgeries can intersect somewhat with their origin), this allows us to find the better matches of the region. PROBLEM: Polar FFT is not resilient to scale changes, so if the forgery was scaled, it will not be detected. Solution: use a select number of fixed scale changes and perform the Polar FFT for each of these scale changes, then select the best match and refine for precision somehow. (if [1, 1.1], 1.2, 1.3, ... then [1, 1.05] then [1, 1.01] something like this)
+| | |
+|---|---|
+| forged images detected | **85.8%** (test 82.7%, val 82.5%, train 87.9%) |
+| unforged images flagged on content | **0.93%** (25 of 2,691) |
+| unforged images flagged including annotations | 5.9% |
 
-  - 2) Feature vectors, use features resilient to rotation, translation and scale changes, like median and standard deviation and more if they exist (look this up). Create a feature vector for each region and then compare the feature vectors to find the best match. This is more robust to scale changes, but it is not as precise as the Polar FFT and limits potencial pairs to regions found by the LIFT stage.
+Detection by source dataset: Broad Bioimage, CAMA, HeLaCytoNuc and TYC 100%, Maize Cobs 99.5%, SIID 96.6%, EMPS 95.2%, MoNuSAC 75.4%, Western blots 48.2%. Missed forgeries are mostly small copied regions that produce fewer than 10 matching keypoints.
 
-I want to try both and compare!
+## Running
 
-## Scientific Method
+Requires Python with `opencv-python` and `numpy`; LIFT also needs `torch` and `h5py`.
 
-There is 1 Dataset split into 4 folders (confirm this later):
- - Folder 1 = All Base Images: bioscientific images with no forgey in them
- - Folder 2 = Train set, about 6450 images with some sort of copy-move forgery
- - Folder 3 = Test set, about 2000 something images  with some sort of copy-move forgery
- - Folder 4 = Val set, about 2000 something images  with some sort of copy-move forgery
-
-Throughout the forgery sets we have masks indicating the exact forgery comminted by marking the two copy-move regions by colour:
-
-- 🔴 **RED** — the pasted (forged) region. 
-- 🟢 **GREEN** — the original region it was copied from. 
-
-The focus of this repo is not to differenciate the origin from the pasted region. This could be a potencial next step
-
-Note that the images without forgeries also has a masks folder. This is an artifact of how all these copy-move forgeries were created, all the distinctive elements of the image (like gels or blobs) have been painted white and the rest of the image is black. This mask could be used to measure the quality of the algorithm used to transform keypoints into regions maybe.
-
-*The base example_images arent named the same as the forged ones. I might need to mess with the .csv file later to rename them properly if it ever became necessary for some reason
-
-To measure success, from both creating regions and detecting frauds **IoU** is utilized, simply *how much the guess and the truth overlap*, from 0 (miss) to 1 (perfect).
-
-## Local folders and Cluster
-
-Inside the local folder there is example images for each of these datasets inside the data/real_samples/ folder.
-
-The path to this same repo inside the cluster (still not yet initialized) is: '~/Src/Pesquisa-Lift-Test', to send files between the local and remote I can use scp or git.
-
-The path from the code to the actual dataset inside the cluster should be the ones inside config/paths.txt (if I didnt fuck anything up)
-
-REBEMBER: Be careful when accesing the cluster, it is a public space, i dont want to alter anyone elses things anywhere.
-
-Cluster access from this computer, ssh tunnel:
 ```bash
-
-ssh diego.santos@ssh.recod.ic.unicamp.br
-
+python src/diagnose_sift.py                         # local sample images in data/real_samples
+python src/diagnose_sift.py --split test            # a dataset split, paths from config/paths.txt
+python src/diagnose_sift.py --split test --features lift
 ```
-
-To run things on the cluster utilize slurm. The run_test_val.sh and run_train.sh are pre-made files with metrics I thought made sense (right now at least)
