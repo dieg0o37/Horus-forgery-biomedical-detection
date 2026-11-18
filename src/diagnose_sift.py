@@ -1,6 +1,6 @@
-"""Stage-by-stage diagnosis of why the SIFT layer misses a known copy-move forgery.
+"""Stage-by-stage diagnosis of why the SIFT or LIFT layer misses a known copy-move forgery.
 
-The SIFT layer can only find a forgery if four things happen in order:
+The layer (--features sift | lift) can only find a forgery if four things happen in order:
 
   1. DETECTION      the same physical point is detected in BOTH copies, so a
                     correct pair of keypoints exists at all.
@@ -14,16 +14,17 @@ Usage:
   python src/diagnose_sift.py
   python src/diagnose_sift.py --ratio-threshold 0.9 --contrast-thresh 0.005
   python src/diagnose_sift.py --split test --preprocess clahe
+  python src/diagnose_sift.py --features lift            # LIFT keypoints + descriptors
 """
 
 import argparse, collections, csv, faulthandler, hashlib, os, random, shutil, signal, socket, sys, time
 import numpy as np, cv2 as cv
 
-from sift_layer import (DEFAULT_PREPROCESS, KNN_K, PREPROCESS_MODES, RANSAC_MAX_CLUSTERS,
-                        RANSAC_MIN_INLIERS, RANSAC_THRESHOLD, find_good_matches,
-                        keep_one_direction, preprocess, run_RANSAC)
+from sift_lift_layer import (DEFAULT_PREPROCESS, FEATURE_METHODS, KNN_K, PREPROCESS_MODES,
+                             RANSAC_MAX_CLUSTERS, RANSAC_MIN_INLIERS, RANSAC_THRESHOLD,
+                             find_good_matches, keep_one_direction, make_feature_extractor,
+                             preprocess, run_RANSAC)
 
-RATIO_SWEEP = (0.6, 0.7, 0.8, 0.9, 0.95, 0.99)
 QUERY_CHUNK = 256   # query rows of the distance matrix held in memory at once
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -225,6 +226,16 @@ CLUSTER_DEFAULTS = {
 }
 
 
+def cluster_direction(c, matrix, inv, tol_px):
+  """Share of a cluster's inlier pairs that are true correspondences, forward
+  (source -> copy) and reverse; the cluster is correct when either is >= 0.5."""
+  a, b = c["kp_pairs"]
+  ah = np.hstack([a, np.ones((len(a), 1), np.float32)])
+  fwd = np.mean(np.linalg.norm(ah @ matrix.T - b, axis=1) <= tol_px)
+  rev = np.mean(np.linalg.norm(ah @ inv.T - b, axis=1) <= tol_px)
+  return fwd, rev
+
+
 def score_clusters(clusters, matrix, inv, src_mask, dst_mask, tol_px, row):
   """Label every RANSAC cluster correct or false against the ground truth.
 
@@ -243,10 +254,7 @@ def score_clusters(clusters, matrix, inv, src_mask, dst_mask, tol_px, row):
   row["n_clusters"] = len(clusters)
   best, directions = None, set()
   for rank, c in enumerate(clusters, 1):
-    a, b = c["kp_pairs"]
-    ah = np.hstack([a, np.ones((len(a), 1), np.float32)])
-    fwd = np.mean(np.linalg.norm(ah @ matrix.T - b, axis=1) <= tol_px)
-    rev = np.mean(np.linalg.norm(ah @ inv.T - b, axis=1) <= tol_px)
+    fwd, rev = cluster_direction(c, matrix, inv, tol_px)
     if max(fwd, rev) < 0.5:
       row["n_clusters_false"] += 1
       continue
@@ -282,15 +290,14 @@ def score_clusters(clusters, matrix, inv, src_mask, dst_mask, tol_px, row):
              best_cluster_purity=round(float(np.mean(pur)), 4))
 
 
-def diagnose_image(gray, src_mask, dst_mask, gt, args):
+def diagnose_image(gray, src_mask, dst_mask, gt, args, extract):
+  """`extract` is make_feature_extractor(...): gray -> (keypoints, descriptors)."""
   matrix, method, gt_iou = gt
   inv = cv.invertAffineTransform(matrix)
 
   t0 = time.perf_counter()
-  sift = cv.SIFT_create(contrastThreshold=args.contrast_thresh,
-                        edgeThreshold=args.edge_thresh)
-  kp, des = sift.detectAndCompute(gray, None)
-  sec_sift = time.perf_counter() - t0
+  kp, des = extract(gray)
+  sec_features = time.perf_counter() - t0
 
   row = {
     "gt_method": method,
@@ -300,29 +307,24 @@ def diagnose_image(gray, src_mask, dst_mask, gt, args):
     "src_area_px": int(np.count_nonzero(src_mask)),
     "dst_area_px": int(np.count_nonzero(dst_mask)),
     "n_kp_total": len(kp),
-    "sec_sift": round(sec_sift, 4), "sec_match": 0.0, "sec_stats": 0.0,
+    "sec_features": round(sec_features, 4), "sec_match": 0.0, "sec_stats": 0.0,
     "sec_ransac": 0.0,
     **CLUSTER_DEFAULTS,
   }
+  # stage funnel: n_detected (a partner keypoint exists), n_detected_far (and
+  # survives min_distance), n_rank1_far (it is the nearest descriptor),
+  # n_pass_dist_first (and passes the ratio test)
   counters = ["n_kp_src", "n_kp_dst", "n_queries", "n_queries_total",
-              "n_detected", "n_detected_far",
-              "n_rank1_far", "n_rank1_all", "n_rank_all_le_knnk",
-              "n_pass_ratio_first", "n_pass_dist_first",
-              "n_blocked_by_duplicate_partner", "n_blocked_by_duplicate_denominator",
-              "n_good_matches", "n_good_matches_correct", "n_correct_pairs_distinct",
-              "n_sim_mismatch"]
+              "n_detected", "n_detected_far", "n_rank1_far", "n_pass_dist_first",
+              "n_good_matches", "n_good_matches_correct", "n_correct_pairs_distinct"]
   row.update({c: 0 for c in counters})
-  row.update({f"n_pass_far_{t:g}": 0 for t in RATIO_SWEEP})
-  row.update({"repeatability": "", "median_rank_all": "", "median_rank_far": "",
-              "median_ratio_global": "", "median_ratio_far": "",
-              "median_ratio_vs_nonpartner": "", "lost_at": ""})
+  row["lost_at"] = ""
 
   if len(kp) == 0:
     row["lost_at"] = "no_keypoints"
     return row
 
   pts = np.array([k.pt for k in kp], dtype=np.float32)
-  sizes = np.array([k.size for k in kp], dtype=np.float32)
   h, w = gray.shape[:2]
   ix = np.clip(np.rint(pts[:, 0]).astype(int), 0, w - 1)
   iy = np.clip(np.rint(pts[:, 1]).astype(int), 0, h - 1)
@@ -358,8 +360,7 @@ def diagnose_image(gray, src_mask, dst_mask, gt, args):
   row["n_matches_kept_correct"] = sum(1 for q, t in kept if q in correct_by_query)
   t0 = time.perf_counter()
   clusters = run_RANSAC([(kp[q], kp[t]) for q, t in kept], RANSAC_MAX_CLUSTERS,
-                        args.ransac_threshold, args.ransac_min_inliers,
-                        image_shape=gray.shape)
+                        args.ransac_threshold, args.ransac_min_inliers)
   row["sec_ransac"] = round(time.perf_counter() - t0, 4)
   score_clusters(clusters, matrix, inv, src_mask, dst_mask, args.tol_px, row)
   if row["cluster_found"]:
@@ -390,17 +391,10 @@ def diagnose_image(gray, src_mask, dst_mask, gt, args):
     return row
 
   qidx = [q[0] for q in queries]
-  # a low contrast threshold on a big image can yield tens of thousands of
-  # keypoints; computing all query rows at once would be hundreds of MB, so
-  # walk the queries in chunks and keep only one chunk of distances alive
+  # a big image can yield tens of thousands of keypoints; computing all query
+  # rows at once would be hundreds of MB, so walk the queries in chunks and
+  # keep only one chunk of distances alive
   chunk, chunk_base = None, -1
-
-  def finish(pair):
-    # the simulation must reproduce the real pipeline query by query; any
-    # disagreement means a stage is being mis-attributed (or k is too small)
-    if (pair["pass_dist_first"] == 1) != bool(pair["found_by_pipeline"]):
-      row["n_sim_mismatch"] += 1
-  ranks_all, ranks_far, ratios_global, ratios_actual, ratios_fair = [], [], [], [], []
 
   for slot, (i, side, fwd) in enumerate(queries):
     expected = fwd @ np.array([pts[i, 0], pts[i, 1], 1.0])
@@ -409,135 +403,37 @@ def diagnose_image(gray, src_mask, dst_mask, gt, args):
     # STAGE 1 -- does a keypoint exist where this one should have been copied?
     partners = np.nonzero(geo <= args.tol_px)[0]
     partners = partners[partners != i]
+    if len(partners) == 0:
+      continue
+    row["n_detected"] += 1
 
     if slot // QUERY_CHUNK != chunk_base:
       chunk_base = slot // QUERY_CHUNK
       chunk = _l2_rows(des, qidx[chunk_base * QUERY_CHUNK:(chunk_base + 1) * QUERY_CHUNK])
     ddesc = chunk[slot % QUERY_CHUNK].copy()
     ddesc[i] = np.inf                                   # the pipeline drops self
-    self_dist = np.linalg.norm(pts - pts[i], axis=1)
-    far = (self_dist > args.min_distance)               # survives min_distance
+    far = np.linalg.norm(pts - pts[i], axis=1) > args.min_distance
     far[i] = False
-
-    pair = {
-      "query_idx": int(i), "side": side,
-      "query_x": round(float(pts[i, 0]), 1), "query_y": round(float(pts[i, 1]), 1),
-      "query_size": round(float(sizes[i]), 2),
-      "expected_x": round(float(expected[0]), 1),
-      "expected_y": round(float(expected[1]), 1),
-      "n_partners": len(partners), "detected": int(len(partners) > 0),
-      "partner_dist_px": "", "partner_size_ratio": "",
-      "rank_all": "", "rank_far": "", "d_partner": "", "d_nn1_far": "",
-      "d_nn2_far": "", "d_best_nonpartner_far": "",
-      "ratio_global": "", "ratio_far": "", "ratio_vs_nonpartner": "",
-      "nn1_is_partner": "", "nn2_is_partner": "",
-      "nn2_all_pixel_dist": "", "pass_ratio_first": "",
-      "pass_dist_first": "", "found_by_pipeline": int(i in correct_by_query),
-    }
-
-    if len(partners) == 0:
-      finish(pair)
-      continue
-    row["n_detected"] += 1
-
-    best_p = partners[np.argmin(geo[partners])]
-    pair["partner_dist_px"] = round(float(geo[best_p]), 2)
-    pair["partner_size_ratio"] = round(float(sizes[best_p] / max(sizes[i], 1e-6)), 3)
-
-    # STAGE 2 -- is the true partner the nearest neighbour in descriptor space?
-    d_partner = float(ddesc[partners].min())
-    pair["d_partner"] = round(d_partner, 2)
-    rank_all = 1 + int(np.count_nonzero(ddesc < d_partner))
-    pair["rank_all"] = rank_all
-    ranks_all.append(rank_all)
-    if rank_all == 1:
-      row["n_rank1_all"] += 1
-    if rank_all <= KNN_K:
-      # knnMatch(k=KNN_K) is the whole candidate window the pipeline ever sees;
-      # a partner ranked below it is invisible no matter what the filters do
-      row["n_rank_all_le_knnk"] += 1
-
-      # OLD ordering, kept for comparison: ratio-test the global top-2 and only
-    # then apply min_distance, which lets a duplicate keypoint sitting on top of
-    # the query become the m2 denominator and sink an otherwise clean match
-    a1, a2 = _two_smallest(ddesc)
-    is_partner = np.zeros(len(pts), dtype=bool)
-    is_partner[partners] = True
-    if a2 is not None:
-      ratio_global = float(ddesc[a1]) / max(float(ddesc[a2]), 1e-9)
-      pair["ratio_global"] = round(ratio_global, 4)
-      pair["nn2_all_pixel_dist"] = round(float(self_dist[a2]), 2)
-      passes = (bool(is_partner[a1]) and ratio_global < args.ratio_threshold
-                and self_dist[a1] > args.min_distance)
-      pair["pass_ratio_first"] = int(passes)
-      if passes:
-        row["n_pass_ratio_first"] += 1
-      if is_partner[a1]:
-        ratios_global.append(ratio_global)
-        if not passes and ratio_global >= args.ratio_threshold:
-          # NN1 was correct; classify what the denominator actually was
-          if is_partner[a2]:
-            row["n_blocked_by_duplicate_partner"] += 1
-          elif self_dist[a2] <= args.min_distance:
-            row["n_blocked_by_duplicate_denominator"] += 1
 
     partners_far = partners[far[partners]]
     if len(partners_far) == 0:
-      # a correct partner exists but min_distance would discard it
-      finish(pair)
-      continue
+      continue                    # a correct partner exists but min_distance discards it
     row["n_detected_far"] += 1
 
-    d_partner_far = float(ddesc[partners_far].min())
+    # STAGE 2 -- is the true partner the nearest descriptor min_distance allows?
     dfar = np.where(far, ddesc, np.inf)
-    rank_far = 1 + int(np.count_nonzero(dfar < d_partner_far))
-    pair["rank_far"] = rank_far
-    ranks_far.append(rank_far)
-    if rank_far == 1:
+    if np.count_nonzero(dfar < float(ddesc[partners_far].min())) == 0:
       row["n_rank1_far"] += 1
 
-    # STAGE 3 -- ratio test, restricted to the keypoints min_distance allows
+    # STAGE 3 -- ratio test on the two nearest that min_distance allows
     nn1, nn2 = _two_smallest(dfar)
-    pair["d_nn1_far"] = round(float(ddesc[nn1]), 2)
-    pair["nn1_is_partner"] = int(bool(is_partner[nn1]))
-    if nn2 is not None:
-      pair["d_nn2_far"] = round(float(ddesc[nn2]), 2)
-      pair["nn2_is_partner"] = int(bool(is_partner[nn2]))
-      ratio_actual = float(ddesc[nn1]) / max(float(ddesc[nn2]), 1e-9)
-      pair["ratio_far"] = round(ratio_actual, 4)
-      if is_partner[nn1]:
-        ratios_actual.append(ratio_actual)
-        for t in RATIO_SWEEP:
-          if ratio_actual < t:
-            row[f"n_pass_far_{t:g}"] += 1
-        if ratio_actual < args.ratio_threshold:
-          row["n_pass_dist_first"] += 1
-          pair["pass_dist_first"] = 1
-        else:
-          pair["pass_dist_first"] = 0
-      else:
-        pair["pass_dist_first"] = 0
-
-    # what the ratio would be if duplicate keypoints on the same spot were
-    # collapsed: the true partner against the best genuinely wrong neighbour
-    d_non = float(np.where(is_partner, np.inf, dfar).min())
-    if np.isfinite(d_non):
-      pair["d_best_nonpartner_far"] = round(d_non, 2)
-      ratio_fair = d_partner_far / max(d_non, 1e-9)
-      pair["ratio_vs_nonpartner"] = round(ratio_fair, 4)
-      ratios_fair.append(ratio_fair)
-
-    finish(pair)
+    is_partner = np.zeros(len(pts), dtype=bool)
+    is_partner[partners] = True
+    if nn2 is not None and is_partner[nn1] and \
+       float(ddesc[nn1]) < args.ratio_threshold * float(ddesc[nn2]):
+      row["n_pass_dist_first"] += 1
 
   row["sec_stats"] = round(time.perf_counter() - t_stats, 4)
-  if row["n_queries"]:
-    row["repeatability"] = round(row["n_detected"] / row["n_queries"], 4)
-  for key, vals in (("median_rank_all", ranks_all), ("median_rank_far", ranks_far),
-                    ("median_ratio_global", ratios_global),
-                    ("median_ratio_far", ratios_actual),
-                    ("median_ratio_vs_nonpartner", ratios_fair)):
-    if vals:
-      row[key] = round(float(np.median(vals)), 4)
 
   # --- which stage destroyed the evidence, in pipeline order ------------------
   if row["n_good_matches_correct"] > 0:
@@ -551,8 +447,8 @@ def diagnose_image(gray, src_mask, dst_mask, gt, args):
   elif row["n_pass_dist_first"] == 0:
     row["lost_at"] = "ratio_test"
   else:
-    # the full-ranking simulation says this should pass, so the only thing left
-    # that can hide it is knnMatch(k=KNN_K) never returning the partner
+    # the full ranking says this should pass, so the only thing left that can
+    # hide it is knnMatch(k=KNN_K) never returning the partner
     row["lost_at"] = "knn_k_truncation"
 
   return row
@@ -685,14 +581,20 @@ def run(args):
     names = names[:args.limit]
   os.makedirs(args.out_dir, exist_ok=True)
   tag = f"_{args.split}" if args.split else ""
-  img_csv = os.path.join(args.out_dir, f"sift_diagnostic{tag}_per_image.csv")
+  img_csv = os.path.join(args.out_dir, f"{args.features}_diagnostic{tag}_per_image.csv")
 
-  skip_csv = os.path.join(args.out_dir, f"sift_diagnostic{tag}_skipped.csv")
+  skip_csv = os.path.join(args.out_dir, f"{args.features}_diagnostic{tag}_skipped.csv")
   if args.copy_failed and not args.failed_dir:
     args.failed_dir = os.path.join(args.out_dir, f"failed{tag}")
   if not args.copy_failed:
     args.failed_dir = None
   args.copy_error = None
+
+  t_model = time.perf_counter()
+  extract = make_feature_extractor(args.features, args.contrast_thresh, args.edge_thresh,
+                                   args.lift_max_kp, args.lift_device, args.lift_model_dir)
+  if args.features == "lift":
+    print(f"LIFT loaded in {time.perf_counter() - t_model:.1f}s", flush=True)
 
   img_rows, skipped = [], []
   img_out = _CsvStream(img_csv)
@@ -709,7 +611,7 @@ def run(args):
         f"{time.perf_counter() - t_list:.1f}s)", flush=True)
 
   t_start = last_beat = time.perf_counter()
-  stage_tot = {"read": 0.0, "gt": 0.0, "sift": 0.0, "match": 0.0, "ransac": 0.0,
+  stage_tot = {"read": 0.0, "gt": 0.0, "features": 0.0, "match": 0.0, "ransac": 0.0,
                "stats": 0.0}
 
   try:
@@ -741,15 +643,15 @@ def run(args):
       gt = estimate_gt_transform(src_mask, dst_mask)
       sec_gt = time.perf_counter() - t0
       gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
-      # quality flags describe the file as stored; SIFT sees the preprocessed
-      # image, exactly as run_sift_layer does
-      row = diagnose_image(preprocess(gray, args.preprocess), src_mask, dst_mask, gt, args)
+      # quality flags describe the file as stored; the features see the
+      # preprocessed image, exactly as run_sift_layer / run_lift_layer do
+      row = diagnose_image(preprocess(gray, args.preprocess), src_mask, dst_mask, gt, args, extract)
       sec_total = time.perf_counter() - t_img
       quality = image_quality(gray, src_mask, dst_mask, args)
       row = {"image_name": name, "source": source_of(name),
              "height": img.shape[0], "width": img.shape[1],
              "gt_ok": int(gt[2] >= args.min_gt_iou),
-             "preprocess": args.preprocess,
+             "features": args.features, "preprocess": args.preprocess,
              **quality,
              **row,
              "sec_read": round(sec_read, 4), "sec_gt": round(sec_gt, 4),
@@ -762,13 +664,13 @@ def run(args):
 
       stage_tot["read"] += sec_read
       stage_tot["gt"] += sec_gt
-      for k in ("sift", "match", "ransac", "stats"):
+      for k in ("features", "match", "ransac", "stats"):
         stage_tot[k] += row[f"sec_{k}"]
 
       if sec_total >= args.slow_sec:
         print(f"  SLOW {sec_total:6.1f}s  {name}  {img.shape[1]}x{img.shape[0]}  "
               f"kp={row['n_kp_total']}  read={sec_read:.1f} gt={sec_gt:.1f} "
-              f"sift={row['sec_sift']:.1f} match={row['sec_match']:.1f} "
+              f"features={row['sec_features']:.1f} match={row['sec_match']:.1f} "
               f"ransac={row['sec_ransac']:.1f} stats={row['sec_stats']:.1f}", flush=True)
 
       now = time.perf_counter()
@@ -795,8 +697,11 @@ def run(args):
 
 def summarise(img_rows, skipped, args, img_csv):
   n = len(img_rows)
-  print(f"\nparams: ratio={args.ratio_threshold} min_distance={args.min_distance} "
-        f"contrast={args.contrast_thresh} edge={args.edge_thresh} tol_px={args.tol_px} "
+  feat = (f"lift max_kp={args.lift_max_kp if args.lift_max_kp is not None else 'default'}"
+          if args.features == "lift" else
+          f"sift contrast={args.contrast_thresh} edge={args.edge_thresh}")
+  print(f"\nparams: features={feat} ratio={args.ratio_threshold} "
+        f"min_distance={args.min_distance} tol_px={args.tol_px} "
         f"preprocess={args.preprocess} ransac_thr={args.ransac_threshold:g} "
         f"min_inliers={args.ransac_min_inliers}")
   print(f"images diagnosed: {n}" + (f"  (skipped {len(skipped)})" if skipped else ""))
@@ -942,10 +847,7 @@ def summarise(img_rows, skipped, args, img_csv):
     ("1 detection: partner exists", "n_detected"),
     ("  survives min_distance    ", "n_detected_far"),
     ("2 description: partner NN1 ", "n_rank1_far"),
-    ("  NN1 before any filtering ", "n_rank1_all"),
-    (f"  inside knnMatch k={KNN_K}", "n_rank_all_le_knnk"),
     ("3 ratio test passes        ", "n_pass_dist_first"),
-    ("  (old ratio-first order)  ", "n_pass_ratio_first"),
   ]
   base = max(wtot("n_queries"), 1)
   for label, key in stages:
@@ -954,43 +856,19 @@ def summarise(img_rows, skipped, args, img_csv):
   print(f"  (stage 1 depends on --tol-px={args.tol_px}: a looser tolerance counts "
         f"sloppier\n   localisations as detected, but those rarely survive stage 2)")
 
-  print("\nratio-threshold sweep (correspondences passing, NN1 correct):")
-  for t in RATIO_SWEEP:
-    v = wtot(f"n_pass_far_{t:g}")
-    print(f"  ratio < {t:<5g} {v:6d}  {100.0*v/base:5.1f}% of queries")
-
-  gain = wtot("n_pass_dist_first") - wtot("n_pass_ratio_first")
-  print(f"\nfilter order: the pipeline drops candidates within min_distance BEFORE "
-        f"the\n  ratio test. Testing the ratio first instead would "
-        f"{'lose' if gain >= 0 else 'gain'} {abs(gain)} correspondence(s),")
-  print(f"  because a duplicate keypoint on the query would act as the m2 denominator:")
-  print(f"    denominator would be a keypoint within min_distance  "
-        f"{wtot('n_blocked_by_duplicate_denominator'):5d}")
-  print(f"    denominator would be a second correct partner        "
-        f"{wtot('n_blocked_by_duplicate_partner'):5d}")
-  print(f"    NN1 status itself lost to a near-duplicate           "
-        f"{wtot('n_rank1_far') - wtot('n_rank1_all'):5d}")
-
-  # the simulation ranks ALL neighbours; the pipeline only sees k=KNN_K of them
   trunc = sum(1 for r in img_rows if r["lost_at"] == "knn_k_truncation")
-  mismatch = tot("n_sim_mismatch")
-  if trunc or mismatch:
-    print(f"\n!! simulation and pipeline DISAGREE on {mismatch} correspondence(s) "
-          f"({trunc} image(s) lost\n   to knnMatch(k={KNN_K}) truncation). Stage "
-          f"attribution is unreliable for those; raise\n   KNN_K in sift_layer.py "
-          f"if truncation is the cause.")
-  else:
-    print(f"\nsimulation and pipeline agree on every examined correspondence, so the "
-          f"stage\n  attribution above is exact (knnMatch k={KNN_K} window is sufficient).")
+  if trunc:
+    print(f"\n!! {trunc} image(s) lost to knnMatch(k={KNN_K}) truncation: raise KNN_K "
+          f"in sift_lift_layer.py")
 
   secs = [float(r["sec_total"]) for r in img_rows if r.get("sec_total")]
   if secs:
     tot_s = sum(secs)
     print(f"\ntiming: {tot_s / 60:.1f} min total, {1000 * tot_s / len(secs):.0f} ms/image "
           f"(median {1000 * float(np.median(secs)):.0f} ms)")
-    for k in ("read", "gt", "sift", "match", "ransac", "stats"):
+    for k in ("read", "gt", "features", "match", "ransac", "stats"):
       v = sum(float(r.get(f"sec_{k}") or 0) for r in img_rows)
-      print(f"  {k:6s} {v / 60:6.1f} min  {100.0 * v / tot_s:4.0f}%")
+      print(f"  {k:8s} {v / 60:6.1f} min  {100.0 * v / tot_s:4.0f}%")
     worst = sorted(img_rows, key=lambda r: -float(r["sec_total"]))[:5]
     print("  slowest images:")
     for r in worst:
@@ -1040,17 +918,28 @@ def parse_args():
   p.add_argument("--slow-sec", type=float, default=10.0,
                  help="report any single image slower than this, with a per-stage breakdown")
 
+  p.add_argument("--features", choices=FEATURE_METHODS, default="sift",
+                 help="keypoints and descriptors: OpenCV SIFT, or LIFT (src/lift.py, "
+                      "needs torch and h5py)")
+  p.add_argument("--lift-max-kp", type=int, default=None,
+                 help="LIFT: keep the N best keypoints (default lift.DEFAULT_MAX_KEYPOINTS "
+                      "= 5000; 0 = keep all)")
+  p.add_argument("--lift-device", default=None,
+                 help="LIFT: torch device (default: cuda, else Apple mps, else cpu)")
+  p.add_argument("--lift-model-dir", default=None,
+                 help="LIFT: folder with picc-best/ and base/ weights (default "
+                      "Lift_model/LIFT/models, or $LIFT_MODEL_DIR; downloaded if missing)")
   p.add_argument("--ratio-threshold", type=float, default=0.7)
   p.add_argument("--min-distance", type=float, default=8.0)
-  p.add_argument("--contrast-thresh", type=float, default=0.01)
-  p.add_argument("--edge-thresh", type=float, default=30.0)
+  p.add_argument("--contrast-thresh", type=float, default=0.01, help="SIFT only")
+  p.add_argument("--edge-thresh", type=float, default=30.0, help="SIFT only")
   p.add_argument("--ransac-threshold", type=float, default=RANSAC_THRESHOLD,
                  help="RANSAC reprojection threshold in px (pipeline default "
                       f"{RANSAC_THRESHOLD:g}; copies shift exactly, so true pairs fit ~0)")
   p.add_argument("--ransac-min-inliers", type=int, default=RANSAC_MIN_INLIERS,
                  help=f"pairs needed to accept a cluster (pipeline default {RANSAC_MIN_INLIERS})")
   p.add_argument("--preprocess", choices=PREPROCESS_MODES, default=DEFAULT_PREPROCESS,
-                 help="contrast normalisation before SIFT, shared with sift_layer.py "
+                 help="contrast normalisation before the features, shared with sift_lift_layer.py "
                       f"(default {DEFAULT_PREPROCESS})")
 
   p.add_argument("--tol-px", type=float, default=3.0,
