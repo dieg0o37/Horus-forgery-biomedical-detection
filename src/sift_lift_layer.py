@@ -1,9 +1,11 @@
 import os, sys, csv, numpy as np, shutil, cv2 as cv
 
+# LIFT's dependencies (torch, h5py) are imported in lift.py, only when LIFT is
+# used, so SIFT runs still work in an environment without torch.
+
 # util/ sits next to src/, so make the repo root importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from util.region_from_kp import _region
-from util import region_from_kp as rk
 # neighbours fetched per query before the min_distance filter. Must be large
 # enough that >=2 candidates survive that filter; diagnose_sift.py reports a
 # 'knn_k_truncation' bucket if it ever is not.
@@ -15,7 +17,11 @@ RANSAC_MAX_CLUSTERS = 100
 # more accurate transforms (1,839 vs 1,822) and 11% fewer false clusters; copies
 # shift pixels exactly, so a loose threshold only lets RANSAC bend the model
 RANSAC_THRESHOLD = 2.0
-RANSAC_MIN_INLIERS = 4
+# 10: an image is flagged only when cluster #1 has at least 10 inliers. On the
+# 2,691 unforged base images it flags 5.9%, and 0.93% on cells, particles, blots
+# or background (the rest are labels, rulers, scale bars); it keeps 85.8% of the
+# 10,619 forged images (90.7% -> 82.7% on test, against 4 inliers)
+RANSAC_MIN_INLIERS = 10
 
 PREPROCESS_MODES = ("none", "stretch", "clahe")
 # stretch is the default: on all 10,619 test/val/train images it found 95.3% of
@@ -37,6 +43,25 @@ def preprocess(gray, mode=DEFAULT_PREPROCESS):
   if mode == "clahe":
     return _CLAHE.apply(gray)
   raise ValueError(f"unknown preprocess mode {mode!r}, expected one of {PREPROCESS_MODES}")
+
+FEATURE_METHODS = ("sift", "lift")
+
+
+def make_feature_extractor(method="sift", contrast_thresh=0.01, edge_thresh=30.0,
+                           lift_max_keypoints=None, lift_device=None, lift_model_dir=None):
+  """A function gray -> (keypoints, descriptors), the contract of
+  cv.SIFT.detectAndCompute, for either feature method. Build it once and reuse
+  it: LIFT loads its network weights here."""
+  if method == "sift":
+    sift = cv.SIFT_create(contrastThreshold=contrast_thresh, edgeThreshold=edge_thresh)
+    return lambda gray: sift.detectAndCompute(gray, None)
+  if method == "lift":
+    from lift import LIFT, DEFAULT_MAX_KEYPOINTS
+    net = LIFT(model_dir=lift_model_dir, device=lift_device,
+               max_keypoints=DEFAULT_MAX_KEYPOINTS if lift_max_keypoints is None else lift_max_keypoints)
+    return net.detect_and_describe
+  raise ValueError(f"unknown feature method {method!r}, expected one of {FEATURE_METHODS}")
+
 
 def keep_one_direction(match_idx):
   return [(q, t) for q, t in match_idx if q > t]
@@ -71,7 +96,7 @@ def find_good_matches(kp, descriptors, ratio_threshold, min_distance, one_direct
   return keep_one_direction(matches) if one_direction else matches
 
 
-def run_RANSAC(good_matches, max_clusters, ransac_threshold, min_inliers, image_shape=None):
+def run_RANSAC(good_matches, max_clusters, ransac_threshold, min_inliers):
   n_matches = len(good_matches)
 
   clusters = []
@@ -83,8 +108,8 @@ def run_RANSAC(good_matches, max_clusters, ransac_threshold, min_inliers, image_
     if len(indices) < min_inliers:
       break
 
-    pts1=np.float32([good_matches[i][0].pt for i in indices])
-    pts2=np.float32([good_matches[i][1].pt for i in indices])
+    pts1=np.float64([good_matches[i][0].pt for i in indices])
+    pts2=np.float64([good_matches[i][1].pt for i in indices])
 
     matrix, inlier_mask = cv.estimateAffinePartial2D(
       pts1, pts2, method=cv.RANSAC, ransacReprojThreshold=ransac_threshold
@@ -110,11 +135,34 @@ def run_RANSAC(good_matches, max_clusters, ransac_threshold, min_inliers, image_
       "kp_pairs": (inl_src, inl_dst),
       "match_indices": inlier_edge_idx,
       "inlier_count": int(n_inliers),
-      "src_region": _region(inl_src, image_shape),
-      "dst_region": _region(inl_dst, image_shape),
+      "src_region": _region(inl_src), # convex hull = {"hull": ..., "bbox": ...}
+      "dst_region": _region(inl_dst),
     })
 
   return clusters
+
+
+
+def run_lift_layer(
+      image_folder_path: str,
+      output_csv: str,
+      image_output_folder: str,
+      failed_image_output_folder: str,
+
+      # Hyperparams
+      _print: bool,
+      ratio_threshold: float,
+      min_distance: float,
+      preprocess_mode: str = DEFAULT_PREPROCESS,
+      use_cuda: bool = None,          # None: CUDA, else Apple GPU, else CPU
+      max_keypoints: int = None,      # None: lift.DEFAULT_MAX_KEYPOINTS; 0: no cap
+      ) -> None:
+    device = None if use_cuda is None else ("cuda" if use_cuda else "cpu")
+    extract = make_feature_extractor("lift", lift_max_keypoints=max_keypoints,
+                                     lift_device=device)
+    _run_layer(extract, image_folder_path, output_csv, image_output_folder,
+               failed_image_output_folder, _print, ratio_threshold, min_distance,
+               preprocess_mode)
 
 
 def run_sift_layer(
@@ -132,8 +180,15 @@ def run_sift_layer(
       edge_thresh: float,
       preprocess_mode: str = DEFAULT_PREPROCESS
       ) -> None:
+    extract = make_feature_extractor("sift", contrast_thresh, edge_thresh)
+    _run_layer(extract, image_folder_path, output_csv, image_output_folder,
+               failed_image_output_folder, _print, ratio_threshold, min_distance,
+               preprocess_mode)
 
-    
+
+def _run_layer(extract, image_folder_path, output_csv, image_output_folder,
+               failed_image_output_folder, _print, ratio_threshold, min_distance,
+               preprocess_mode):
     if _print:
       os.makedirs(image_output_folder, exist_ok=True)
       os.makedirs(failed_image_output_folder, exist_ok=True)
@@ -162,9 +217,7 @@ def run_sift_layer(
 
         gray_img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
 
-        sift = cv.SIFT_create(contrastThreshold=contrast_thresh, edgeThreshold=edge_thresh)
-
-        kp, descriptors = sift.detectAndCompute(preprocess(gray_img, preprocess_mode), None)
+        kp, descriptors = extract(preprocess(gray_img, preprocess_mode))
 
         if _print:
             kp_img = cv.drawKeypoints(image=gray_img, keypoints=kp, outImage=None, flags=cv.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
@@ -177,8 +230,7 @@ def run_sift_layer(
         sus_match_count = len(good_matches)
 
         clusters = run_RANSAC(good_matches=good_matches, max_clusters=RANSAC_MAX_CLUSTERS,
-                              ransac_threshold=RANSAC_THRESHOLD, min_inliers=RANSAC_MIN_INLIERS,
-                              image_shape=gray_img.shape)
+                              ransac_threshold=RANSAC_THRESHOLD, min_inliers=RANSAC_MIN_INLIERS)
         n_clusters = len(clusters)
 
         if n_clusters==0 and _print:
@@ -205,16 +257,24 @@ if __name__ == "__main__":
     elif input[0]=="False":
        _print=False
     else:
-      print("input format: python sift_layer.py <_print> <ratio_threshold> <min_distance> <contrast_threshold> <edge_threshold> [none|stretch|clahe] (default stretch)")
+      print("input format: python sift_lift_layer.py <_print> <ratio_threshold> <min_distance> <contrast_threshold> <edge_threshold> [none|stretch|clahe] [sift|lift] (defaults stretch, sift; contrast/edge only apply to sift)")
       exit(1)
     ratio_threshold = float(input[1])
     min_dist = float(input[2])
     contrast_threshold = float(input[3])
     edge_threshold = float(input[4])
     preprocess_mode = input[5] if len(input) > 5 else DEFAULT_PREPROCESS
-    if preprocess_mode not in PREPROCESS_MODES:
-      print("input format: python sift_layer.py <_print> <ratio_threshold> <min_distance> <contrast_threshold> <edge_threshold> [none|stretch|clahe] (default stretch)")
+    features = input[6] if len(input) > 6 else "sift"
+    if preprocess_mode not in PREPROCESS_MODES or features not in FEATURE_METHODS:
+      print("input format: python sift_lift_layer.py <_print> <ratio_threshold> <min_distance> <contrast_threshold> <edge_threshold> [none|stretch|clahe] [sift|lift] (defaults stretch, sift; contrast/edge only apply to sift)")
       exit(1)
+    if features == "lift":
+      run_lift_layer(image_folder_path=image_folder_path, output_csv=output_csv,
+                     image_output_folder=image_output_folder,
+                     failed_image_output_folder=failed_image_output_folder,
+                     _print=_print, ratio_threshold=ratio_threshold,
+                     min_distance=min_dist, preprocess_mode=preprocess_mode)
+      exit(0)
     run_sift_layer(
        image_folder_path=image_folder_path,
        output_csv=output_csv,
@@ -230,7 +290,7 @@ if __name__ == "__main__":
     )
     # clusters = run_RANSAC(good_matches=good_matches, max_clusters=100, ransac_threshold=5.0, min_inliers=4)
   except TypeError:
-     print("input format: python sift_layer.py <_print> <ratio_threshold> <min_distance> <contrast_threshold> <edge_threshold> [none|stretch|clahe] (default stretch)")
+     print("input format: python sift_lift_layer.py <_print> <ratio_threshold> <min_distance> <contrast_threshold> <edge_threshold> [none|stretch|clahe] [sift|lift] (defaults stretch, sift; contrast/edge only apply to sift)")
      exit(1)
       
 
